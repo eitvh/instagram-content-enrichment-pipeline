@@ -2,8 +2,8 @@ import sys
 import time
 from typing import Callable, List, Optional, TypeVar
 
-import pymysql
-from pymysql.cursors import DictCursor
+import pymysql # type: ignore
+from pymysql.cursors import DictCursor # type: ignore
 
 from settings import (
     DB_DATABASE,
