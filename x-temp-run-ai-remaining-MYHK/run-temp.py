@@ -16,7 +16,7 @@ New fields per document:
   gemini_extraction_model, gemini_processing_updated_at
 
 Usage:
-    # Random sample of 1000 posts, process and upsert to temp collection
+    # Read indexed MongoDB posts for the default locationId=3
     python run-temp.py
 
     # Process 100 posts with 5 workers
@@ -25,8 +25,8 @@ Usage:
     # Skip posts already in the temp collection (incremental mode)
     python run-temp.py --skip-existing
 
-    # Read fresh posts from MySQL directly
-    python run-temp.py --source mysql --location-id 1 --limit 2000
+    # Read fresh posts from MySQL and keep only MongoDB locationId=3
+    python run-temp.py --source mysql --location-id 3 --limit 2000
 """
 
 import os
@@ -57,6 +57,8 @@ MONGO_URI = os.getenv("MONGO_URI_ATLAS", "")
 MONGO_DATABASE = os.getenv("MONGO_DB_NAME", "ai-vector-search")
 MONGO_SOURCE_COLLECTION = "ig-post"
 MONGO_TEMP_COLLECTION = "ig-post-embeddings-test"
+MONGO_LOCATION_INDEX = os.getenv("MONGO_LOCATION_INDEX", "locationId_1")
+MONGO_QUERY_TIMEOUT_MS = int(os.getenv("MONGO_QUERY_TIMEOUT_MS", "30000"))
 
 # MySQL
 MYSQL_HOST = os.getenv("CRAWL_DB_HOST", "localhost")
@@ -80,7 +82,7 @@ EMBEDDING_INPUT_PRICE = float(os.getenv("EMBEDDING_INPUT_PRICE", "0.20"))
 # Processing
 DEFAULT_LIMIT = 5   # post per run (always modify this)
 DEFAULT_BATCH_SIZE = 1000   # post per batch
-DEFAULT_LOCATION_ID = 1
+DEFAULT_LOCATION_ID = 3
 MAX_WORKERS = int(os.getenv("MAX_WORKERS", "8")) # can set max workers to 8
 REQUEST_DELAY_SECONDS = float(os.getenv("REQUEST_DELAY_SECONDS", "0.25"))
 MAX_RETRIES = int(os.getenv("MAX_RETRIES", "5"))
@@ -630,46 +632,118 @@ def connect_mongodb() -> Tuple[MongoClient, Any, Any]:
     return client, database, source_collection
 
 
+def normalize_location_id(value: Any) -> Optional[int]:
+    """Return a location ID as int when possible, otherwise None."""
+    if value is None or isinstance(value, bool):
+        return None
+    try:
+        return int(str(value).strip())
+    except (TypeError, ValueError):
+        return None
+
+
+def mongo_scalar_variants(value: Any) -> List[Any]:
+    """Return string/int variants so MongoDB lookups tolerate mixed field types."""
+    text_value = str(value).strip()
+    variants: List[Any] = []
+    if text_value:
+        variants.append(text_value)
+        if text_value.isdigit():
+            try:
+                variants.append(int(text_value))
+            except (TypeError, ValueError, OverflowError):
+                pass
+    return variants
+
+
 def fetch_mongodb_post_ids(
     collection: Any,
     max_posts: int,
+    location_id: int,
+    offset: int = 0,
 ) -> List[Dict[str, Any]]:
     """
-    Randomly sample documents from MongoDB ig-post collection.
+    Fetch documents from MongoDB ig-post for one location using locationId_1.
 
-    Uses a two-step approach for speed:
-      1. $sample on _id only (fast — no full document scan)
-      2. Fetch full documents by _id (indexed)
-
-    Each batch gets truly random documents across the full 3.5M range.
+    This intentionally avoids `$match` followed by `$sample`, which can be
+    expensive on a multi-million-document collection. The checkpointed offset
+    advances each batch so the pipeline does not repeatedly fetch the same
+    first documents.
     """
-    # Step 1: get random _ids using $sample on projection only
-    random_ids = []
-    for doc in collection.aggregate(
-        [{"$sample": {"size": max_posts}}, {"$project": {"_id": 1}}],
-        allowDiskUse=True,
-    ):
-        random_ids.append(doc["_id"])
+    requested_location = int(location_id)
+    requested_limit = max(0, int(max_posts))
+    requested_offset = max(0, int(offset))
 
-    if not random_ids:
+    if requested_limit == 0:
         return []
 
-    # Step 2: fetch full documents by _id
-    records = []
-    for doc in collection.find({"_id": {"$in": random_ids}}):
-        record = {
-            "mongo_id": doc["_id"],
-            "user_id": str(doc.get("user_id", "")),
-            "post_id": str(doc.get("post_id", "")),
-            "locationId": doc.get("locationId"),
-            "stats": doc.get("stats"),
-        }
-        records.append(record)
+    query = {
+        "locationId": {"$in": mongo_scalar_variants(requested_location)},
+    }
+    projection = {
+        "_id": 1,
+        "user_id": 1,
+        "post_id": 1,
+        "locationId": 1,
+        "stats": 1,
+    }
 
-    print(f"[mongodb] Randomly sampled {len(records)} documents from {MONGO_SOURCE_COLLECTION}")
+    print(
+        f"[mongodb] Fetching up to {requested_limit} posts "
+        f"for locationId={requested_location} offset={requested_offset} "
+        f"using index={MONGO_LOCATION_INDEX}..."
+    )
+
+    records: List[Dict[str, Any]] = []
+
+    try:
+        cursor = (
+            collection.find(query, projection)
+            .hint(MONGO_LOCATION_INDEX)
+            .skip(requested_offset)
+            .limit(requested_limit)
+            .max_time_ms(MONGO_QUERY_TIMEOUT_MS)
+        )
+
+        for doc in cursor:
+            actual_location = normalize_location_id(doc.get("locationId"))
+            if actual_location != requested_location:
+                continue
+
+            user_id = str(doc.get("user_id", "")).strip()
+            post_id = str(doc.get("post_id", "")).strip()
+            if not user_id or not post_id:
+                continue
+
+            records.append({
+                "mongo_id": doc.get("_id"),
+                "user_id": user_id,
+                "post_id": post_id,
+                "locationId": requested_location,
+                "stats": doc.get("stats"),
+            })
+
+    except pymongo.errors.ExecutionTimeout as error:
+        raise RuntimeError(
+            f"MongoDB query exceeded {MONGO_QUERY_TIMEOUT_MS} ms while reading "
+            f"locationId={requested_location}. Confirm that the source collection "
+            f"has the index named {MONGO_LOCATION_INDEX!r}."
+        ) from error
+    except pymongo.errors.OperationFailure as error:
+        message = str(error)
+        if "hint" in message.lower() or "index" in message.lower():
+            raise RuntimeError(
+                f"MongoDB could not use index {MONGO_LOCATION_INDEX!r}. "
+                "Check the exact index name in Atlas or set MONGO_LOCATION_INDEX "
+                "in your .env file."
+            ) from error
+        raise
+
+    print(
+        f"[mongodb] Fetched {len(records)} posts from "
+        f"{MONGO_SOURCE_COLLECTION} for locationId={requested_location}"
+    )
     return records
-
-
 
 
 
@@ -742,14 +816,15 @@ def fetch_captions_from_mysql(
 
 
 def fetch_posts_from_mysql_direct(
-    location_id: int,
     max_posts: int,
     offset: int = 0,
 ) -> List[Dict[str, Any]]:
     """
-    Read new post IDs and captions directly from MySQL (skip MongoDB lookup).
+    Read candidate post IDs and captions directly from MySQL.
 
-    Returns list of dicts with keys: user_id, post_id, caption.
+    MySQL ig_post is not assumed to contain locationId. Location filtering is
+    performed afterward against MongoDB ig-post, which is the source of truth
+    for locationId and stats.
     """
     query = """
         SELECT CAST(ig_user_id AS CHAR) AS user_id,
@@ -763,7 +838,7 @@ def fetch_posts_from_mysql_direct(
         LIMIT %s OFFSET %s
     """
     connection = connect_mysql()
-    posts = []
+    posts: List[Dict[str, Any]] = []
     try:
         with connection.cursor() as cursor:
             cursor.execute(query, (MIN_CAPTION_LENGTH, max_posts, offset))
@@ -778,8 +853,82 @@ def fetch_posts_from_mysql_direct(
     finally:
         connection.close()
 
-    print(f"[mysql] Direct read: {len(posts)} posts from ig_post (location_id={location_id})")
+    print(
+        f"[mysql] Direct read: {len(posts)} candidate posts from ig_post "
+        f"(offset={offset})"
+    )
     return posts
+
+
+def attach_mongodb_location_metadata(
+    collection: Any,
+    posts: List[Dict[str, Any]],
+    location_id: int,
+) -> List[Dict[str, Any]]:
+    """
+    Keep only MySQL posts that exist in MongoDB ig-post at location_id.
+
+    This performs one batched MongoDB query instead of one find_one per post.
+    post_id and locationId are queried using string/int variants, then user_id
+    and post_id are compared as normalized strings in Python.
+    """
+    if not posts:
+        return []
+
+    requested_location = int(location_id)
+    post_id_values: List[Any] = []
+    seen_values: Set[Tuple[str, str]] = set()
+    for post in posts:
+        for value in mongo_scalar_variants(post.get("post_id", "")):
+            marker = (type(value).__name__, str(value))
+            if marker not in seen_values:
+                seen_values.add(marker)
+                post_id_values.append(value)
+
+    if not post_id_values:
+        return []
+
+    query = {
+        "post_id": {"$in": post_id_values},
+        "locationId": {"$in": mongo_scalar_variants(requested_location)},
+    }
+    projection = {
+        "_id": 1,
+        "user_id": 1,
+        "post_id": 1,
+        "locationId": 1,
+        "stats": 1,
+    }
+
+    mongo_by_pair: Dict[Tuple[str, str], Dict[str, Any]] = {}
+    for document in collection.find(query, projection):
+        actual_location = normalize_location_id(document.get("locationId"))
+        if actual_location != requested_location:
+            continue
+        key = (
+            str(document.get("user_id", "")),
+            str(document.get("post_id", "")),
+        )
+        mongo_by_pair[key] = document
+
+    matched_posts: List[Dict[str, Any]] = []
+    for post in posts:
+        key = (str(post.get("user_id", "")), str(post.get("post_id", "")))
+        mongo_document_value = mongo_by_pair.get(key)
+        if not mongo_document_value:
+            continue
+
+        enriched = dict(post)
+        enriched["mongo_id"] = mongo_document_value.get("_id")
+        enriched["locationId"] = requested_location
+        enriched["stats"] = mongo_document_value.get("stats")
+        matched_posts.append(enriched)
+
+    print(
+        f"[mongodb] Matched {len(matched_posts)}/{len(posts)} MySQL candidates "
+        f"to {MONGO_SOURCE_COLLECTION} with locationId={requested_location}"
+    )
+    return matched_posts
 
 
 
@@ -1025,24 +1174,32 @@ def load_bson_json(path: str, default: Any) -> Any:
         return default
 
 
-def new_processed_state() -> Dict[str, Any]:
+def new_processed_state(source: str, location_id: int) -> Dict[str, Any]:
     return {
-        "version": 1,
+        "version": 2,
         "database": MONGO_DATABASE,
         "collection": MONGO_TEMP_COLLECTION,
+        "source": str(source),
+        "location_id": int(location_id),
         "updated_at": now_text(),
         "posts": {},
     }
 
 
-def load_processed_state(reset: bool) -> Dict[str, Any]:
+def load_processed_state(source: str, location_id: int, reset: bool) -> Dict[str, Any]:
     if reset and Path(PROCESSED_POSTID_FILE).exists():
         Path(PROCESSED_POSTID_FILE).unlink()
-    state = load_plain_json(PROCESSED_POSTID_FILE, new_processed_state())
+    default_state = new_processed_state(source, location_id)
+    state = load_plain_json(PROCESSED_POSTID_FILE, default_state)
     if not isinstance(state, dict) or not isinstance(state.get("posts"), dict):
-        state = new_processed_state()
-    if state.get("database") != MONGO_DATABASE or state.get("collection") != MONGO_TEMP_COLLECTION:
-        state = new_processed_state()
+        return default_state
+    if (
+        state.get("database") != MONGO_DATABASE
+        or state.get("collection") != MONGO_TEMP_COLLECTION
+        or state.get("source") != str(source)
+        or normalize_location_id(state.get("location_id")) != int(location_id)
+    ):
+        return default_state
     return state
 
 
@@ -1090,22 +1247,32 @@ def processed_counts(processed_state: Dict[str, Any]) -> Dict[str, int]:
     return counts
 
 
-def new_stage_state() -> Dict[str, Any]:
+def new_stage_state(source: str, location_id: int) -> Dict[str, Any]:
     return {
-        "version": 1,
+        "version": 2,
         "database": MONGO_DATABASE,
         "collection": MONGO_TEMP_COLLECTION,
+        "source": str(source),
+        "location_id": int(location_id),
         "updated_at": now_text(),
         "records": {},
     }
 
 
-def load_stage_state() -> Dict[str, Any]:
-    state = load_bson_json(TEMP_RECORDS_FILE, new_stage_state())
+def load_stage_state(source: str, location_id: int, reset: bool) -> Dict[str, Any]:
+    if reset and Path(TEMP_RECORDS_FILE).exists():
+        Path(TEMP_RECORDS_FILE).unlink()
+    default_state = new_stage_state(source, location_id)
+    state = load_bson_json(TEMP_RECORDS_FILE, default_state)
     if not isinstance(state, dict) or not isinstance(state.get("records"), dict):
-        state = new_stage_state()
-    if state.get("database") != MONGO_DATABASE or state.get("collection") != MONGO_TEMP_COLLECTION:
-        state = new_stage_state()
+        return default_state
+    if (
+        state.get("database") != MONGO_DATABASE
+        or state.get("collection") != MONGO_TEMP_COLLECTION
+        or state.get("source") != str(source)
+        or normalize_location_id(state.get("location_id")) != int(location_id)
+    ):
+        return default_state
     return state
 
 
@@ -1119,14 +1286,17 @@ def stage_record(stage_state: Dict[str, Any], record: Dict[str, Any]) -> None:
     save_stage_state(stage_state)
 
 
-def new_checkpoint(limit: int) -> Dict[str, Any]:
+def new_checkpoint(limit: int, source: str, location_id: int) -> Dict[str, Any]:
     return {
-        "version": 1,
+        "version": 3,
         "database": MONGO_DATABASE,
         "source_collection": MONGO_SOURCE_COLLECTION,
         "target_collection": MONGO_TEMP_COLLECTION,
+        "source": str(source),
+        "location_id": int(location_id),
         "requested_limit": int(limit),
         "batch_number": 0,
+        "mongo_offset": 0,
         "mysql_offset": 0,
         "processing_time_seconds": 0.0,
         "usage": get_usage_snapshot(),
@@ -1136,19 +1306,30 @@ def new_checkpoint(limit: int) -> Dict[str, Any]:
     }
 
 
-def load_checkpoint(limit: int, reset: bool) -> Dict[str, Any]:
+def load_checkpoint(
+    limit: int,
+    source: str,
+    location_id: int,
+    reset: bool,
+) -> Dict[str, Any]:
     if reset and Path(CHECKPOINT_FILE).exists():
         Path(CHECKPOINT_FILE).unlink()
-    state = load_plain_json(CHECKPOINT_FILE, new_checkpoint(limit))
+    default_state = new_checkpoint(limit, source, location_id)
+    state = load_plain_json(CHECKPOINT_FILE, default_state)
     if not isinstance(state, dict):
-        state = new_checkpoint(limit)
+        state = default_state
     if (
-        state.get("database") != MONGO_DATABASE
+        int(state.get("version", 0) or 0) != 3
+        or state.get("database") != MONGO_DATABASE
         or state.get("source_collection") != MONGO_SOURCE_COLLECTION
         or state.get("target_collection") != MONGO_TEMP_COLLECTION
+        or state.get("source") != str(source)
+        or normalize_location_id(state.get("location_id")) != int(location_id)
     ):
-        state = new_checkpoint(limit)
+        state = default_state
     state["requested_limit"] = int(limit)
+    state["source"] = str(source)
+    state["location_id"] = int(location_id)
     return state
 
 
@@ -1561,16 +1742,19 @@ def process_posts() -> None:
     max_posts = max(0, int(args.limit))
     batch_size = max(1, int(args.batch_size))
     workers = max(1, int(args.workers))
+    location_id = int(args.location_id)
     reset = bool(args.reset_checkpoint)
+
     if reset:
-        for path in (PROCESSED_POSTID_FILE, CHECKPOINT_FILE, REALTIME_SUMMARY_FILE):
+        for path in (REALTIME_SUMMARY_FILE, POSTS_BACKUP_FILE):
             if Path(path).exists():
                 Path(path).unlink()
-    processed_state = load_processed_state(False)
-    stage_state = load_stage_state()
+
+    processed_state = load_processed_state(args.source, location_id, reset)
+    stage_state = load_stage_state(args.source, location_id, reset)
     save_processed_state(processed_state)
     save_stage_state(stage_state)
-    checkpoint = load_checkpoint(max_posts, False)
+    checkpoint = load_checkpoint(max_posts, args.source, location_id, reset)
     restore_usage(checkpoint.get("usage", {}))
     checkpoint["stopped"] = False
     checkpoint["last_stop_reason"] = ""
@@ -1583,6 +1767,7 @@ def process_posts() -> None:
     print("=" * 70)
     print("Embedding Test Pipeline")
     print(f"Source: {args.source}")
+    print(f"Location ID: {location_id}")
     print(f"Post limit: {max_posts}")
     print(f"Batch size: {batch_size}")
     print(f"Workers: {workers}")
@@ -1637,7 +1822,14 @@ def process_posts() -> None:
             print(f"\n[batch {checkpoint['batch_number']}] target={desired} candidates={candidate_take}")
 
             if args.source == "mongodb":
-                candidates = fetch_mongodb_post_ids(mongo_source_collection, candidate_take)
+                offset = int(checkpoint.get("mongo_offset", 0) or 0)
+                candidates = fetch_mongodb_post_ids(
+                    mongo_source_collection,
+                    candidate_take,
+                    location_id,
+                    offset,
+                )
+                checkpoint["mongo_offset"] = offset + candidate_take
                 pairs = [(item["user_id"], item["post_id"]) for item in candidates]
                 captions = fetch_captions_from_mysql(pairs)
                 posts = []
@@ -1649,27 +1841,30 @@ def process_posts() -> None:
                         posts.append(item)
             else:
                 offset = int(checkpoint.get("mysql_offset", 0) or 0)
-                posts = fetch_posts_from_mysql_direct(
-                    int(args.location_id),
+                mysql_candidates = fetch_posts_from_mysql_direct(
                     candidate_take,
                     offset,
                 )
-                checkpoint["mysql_offset"] = offset + len(posts)
-                for post in posts:
-                    mongo_document_value = mongo_source_collection.find_one(
-                        {"user_id": post["user_id"], "post_id": post["post_id"]},
-                        {"_id": 1, "locationId": 1, "stats": 1},
-                    )
-                    if mongo_document_value:
-                        post["mongo_id"] = mongo_document_value.get("_id")
-                        post["locationId"] = mongo_document_value.get("locationId")
-                        post["stats"] = mongo_document_value.get("stats")
+                checkpoint["mysql_offset"] = offset + candidate_take
+                posts = attach_mongodb_location_metadata(
+                    mongo_source_collection,
+                    mysql_candidates,
+                    location_id,
+                )
 
             terminal_ids = set(processed_state.get("posts", {}).keys())
             staged_ids = set(stage_state.get("records", {}).keys())
             filtered: List[Dict[str, Any]] = []
             for post in posts:
                 post_id = str(post.get("post_id", ""))
+                actual_location = normalize_location_id(post.get("locationId"))
+                if actual_location != location_id:
+                    print(
+                        f"[location-skip] post_id={post_id or '<missing>'} "
+                        f"expected={location_id} actual={post.get('locationId')!r}"
+                    )
+                    continue
+                post["locationId"] = location_id
                 if not post_id or post_id in terminal_ids or post_id in staged_ids or post_id in seen_session:
                     continue
                 seen_session.add(post_id)
