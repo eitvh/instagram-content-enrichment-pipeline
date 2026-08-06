@@ -1,0 +1,12 @@
+.env 
+test.py
+*.xlsx
+*.csv
+*.jsonl
+*.pyc
+*.json
+*.done
+*.pyc
+z_output/
+*.csv
+.venv
