@@ -1,0 +1,193 @@
+"""Runtime settings loaded from environment variables."""
+
+import os
+from pathlib import Path
+
+from dotenv import load_dotenv # type: ignore
+
+load_dotenv()
+
+BASE_DIR = Path(__file__).resolve().parent
+
+
+def _get_int(name: str, raw_value: str, minimum: int | None = None) -> int:
+    try:
+        value = int(raw_value)
+    except ValueError as exc:
+        raise ValueError(
+            f"Invalid {name} value {raw_value!r}. Use an integer."
+        ) from exc
+
+    if minimum is not None and value < minimum:
+        raise ValueError(
+            f"Invalid {name} value {value!r}. Use a value greater than or equal to {minimum}."
+        )
+
+    return value
+
+
+def _get_float(name: str, raw_value: str, minimum: float | None = None) -> float:
+    try:
+        value = float(raw_value)
+    except ValueError as exc:
+        raise ValueError(
+            f"Invalid {name} value {raw_value!r}. Use a number."
+        ) from exc
+
+    if minimum is not None and value < minimum:
+        raise ValueError(
+            f"Invalid {name} value {value!r}. Use a value greater than or equal to {minimum}."
+        )
+
+    return value
+
+
+# mongodb settings
+MONGO_URI = (
+    os.getenv("MONGO_URI_ATLAS_SG")
+    or os.getenv("MONGO_URI_ATLAS")
+    or ""
+).strip()
+MONGO_DATABASE = (
+    os.getenv("MONGO_DB_ATLAS_SG")
+    or os.getenv("MONGO_DB_ATLAS")
+    or "ai-vector-search-transit"
+).strip()
+MONGO_SOURCE_COLLECTION = (
+    os.getenv("MONGO_COLL_ATLAS_SG")
+    or os.getenv("MONGO_COLL_ATLAS")
+    or "ig-post-sg"
+).strip()
+MONGO_TEMP_COLLECTION = (
+    os.getenv("MONGO_TEMP_COLL_ATLAS_SG")
+    or os.getenv("MONGO_TEMP_COLLECTION")
+    or MONGO_SOURCE_COLLECTION
+).strip()
+
+# mysql settings
+MYSQL_HOST = (
+    os.getenv("CRAWL_DB_HOST")
+    or os.getenv("CRAWL_DB_READ_HOST")
+    or os.getenv("crawl_db_hostname")
+    or "localhost"
+).strip()
+MYSQL_PORT_RAW = (
+    os.getenv("CRAWL_DB_PORT")
+    or os.getenv("db_port")
+    or "3306"
+).strip()
+MYSQL_USER = (
+    os.getenv("CRAWL_DB_USERNAME")
+    or os.getenv("CRAWL_DB_USER")
+    or os.getenv("crawl_db_username")
+    or ""
+).strip()
+MYSQL_PASSWORD = (
+    os.getenv("CRAWL_DB_PASSWORD")
+    or os.getenv("crawl_db_password")
+    or ""
+)
+MYSQL_DATABASE = (
+    os.getenv("CRAWL_DB_DATABASE")
+    or os.getenv("CRAWL_DB_NAME")
+    or os.getenv("crawl_db_name")
+    or "cloudbreakr_db2"
+).strip()
+
+# gemini settings
+GEMINI_API_KEY = (os.getenv("GEMINI_API_KEY") or "").strip()
+GEMINI_EXTRACTION_MODEL = (
+    os.getenv("GEMINI_EXTRACTION_MODEL")
+    or "gemini-3.1-flash-lite"
+).strip()
+GEMINI_EMBEDDING_MODEL = (
+    os.getenv("GEMINI_EMBEDDING_MODEL")
+    or "gemini-embedding-2"
+).strip()
+EMBED_DIM_RAW = (os.getenv("EMBED_DIM") or "1536").strip()
+
+# pricing settings
+EXTRACTION_INPUT_PRICE_RAW = (
+    os.getenv("EXTRACTION_INPUT_PRICE") or "0.25"
+).strip()
+EXTRACTION_OUTPUT_PRICE_RAW = (
+    os.getenv("EXTRACTION_OUTPUT_PRICE") or "1.50"
+).strip()
+EMBEDDING_INPUT_PRICE_RAW = (
+    os.getenv("EMBEDDING_INPUT_PRICE") or "0.20"
+).strip()
+
+# processing settings
+DEFAULT_LIMIT_RAW = (os.getenv("DEFAULT_LIMIT") or "500000").strip()
+DEFAULT_BATCH_SIZE_RAW = (os.getenv("DEFAULT_BATCH_SIZE") or "1000").strip()
+DEFAULT_LOCATION_ID_RAW = (os.getenv("DEFAULT_LOCATION_ID") or "4").strip()
+MAX_WORKERS_RAW = (os.getenv("MAX_WORKERS") or "8").strip()
+REQUEST_DELAY_SECONDS_RAW = (
+    os.getenv("REQUEST_DELAY_SECONDS") or "0.25"
+).strip()
+MAX_RETRIES_RAW = (os.getenv("MAX_RETRIES") or "5").strip()
+MIN_CAPTION_LENGTH_RAW = (
+    os.getenv("MIN_CAPTION_LENGTH") or "20"
+).strip()
+
+
+def get_mysql_port() -> int:
+    return _get_int("database port", MYSQL_PORT_RAW, minimum=1)
+
+
+def get_embed_dim() -> int:
+    return _get_int("embedding dimension", EMBED_DIM_RAW, minimum=1)
+
+
+MYSQL_PORT = get_mysql_port()
+EMBED_DIM = get_embed_dim()
+EXTRACTION_INPUT_PRICE = _get_float(
+    "extraction input price",
+    EXTRACTION_INPUT_PRICE_RAW,
+    minimum=0,
+)
+EXTRACTION_OUTPUT_PRICE = _get_float(
+    "extraction output price",
+    EXTRACTION_OUTPUT_PRICE_RAW,
+    minimum=0,
+)
+EMBEDDING_INPUT_PRICE = _get_float(
+    "embedding input price",
+    EMBEDDING_INPUT_PRICE_RAW,
+    minimum=0,
+)
+DEFAULT_LIMIT = _get_int("default limit", DEFAULT_LIMIT_RAW, minimum=0)
+DEFAULT_BATCH_SIZE = _get_int(
+    "default batch size",
+    DEFAULT_BATCH_SIZE_RAW,
+    minimum=1,
+)
+DEFAULT_LOCATION_ID = _get_int(
+    "default location id",
+    DEFAULT_LOCATION_ID_RAW,
+    minimum=0,
+)
+MAX_WORKERS = _get_int("max workers", MAX_WORKERS_RAW, minimum=1)
+REQUEST_DELAY_SECONDS = _get_float(
+    "request delay seconds",
+    REQUEST_DELAY_SECONDS_RAW,
+    minimum=0,
+)
+MAX_RETRIES = _get_int("max retries", MAX_RETRIES_RAW, minimum=1)
+MIN_CAPTION_LENGTH = _get_int(
+    "minimum caption length",
+    MIN_CAPTION_LENGTH_RAW,
+    minimum=0,
+)
+
+# output settings
+OUTPUT_DIR = Path(os.getenv("GEMINI_OUTPUT_DIR") or BASE_DIR / "output").resolve()
+POSTS_BACKUP_FILE = OUTPUT_DIR / "posts.json"
+SUMMARY_OUTPUT_FILE = OUTPUT_DIR / "processing_summary.json"
+CHECKPOINT_FILE = Path(
+    os.getenv("GEMINI_CHECKPOINT_FILE")
+    or BASE_DIR / "ig_post_sg_gemini_checkpoint.json"
+).resolve()
+PROCESSING_VERSION = (
+    f"{GEMINI_EXTRACTION_MODEL}|{GEMINI_EMBEDDING_MODEL}|{EMBED_DIM}"
+)
