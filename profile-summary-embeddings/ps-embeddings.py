@@ -6,7 +6,7 @@ import argparse
 import threading
 from datetime import datetime, timezone
 from concurrent.futures import ThreadPoolExecutor, as_completed
-from typing import Any, Dict, List, Optional, Tuple
+from typing import Any, Dict, List, Tuple
 
 from dotenv import load_dotenv
 import pymysql
@@ -48,7 +48,7 @@ CHECKPOINT_FILE = os.path.abspath(
     )
 )
 
-PROCESSING_VERSION = f"{GEMINI_EMBEDDING_MODEL}|{GEMINI_EMBEDDING_TASK_TYPE}|{EMBED_DIM}"
+PROCESSING_VERSION = f"{GEMINI_EMBEDDING_MODEL}|{GEMINI_EMBEDDING_TASK_TYPE}|{EMBED_DIM}|response-filter-v1"
 
 _usage_lock = threading.Lock()
 _usage = {"embedding_input_tokens": 0}
@@ -118,6 +118,34 @@ def normalize_summary(value: Any) -> str:
     return text.strip()
 
 
+def has_embeddable_response(summary_text: str) -> bool:
+    if not summary_text:
+        return False
+
+    try:
+        payload = json.loads(summary_text)
+    except (json.JSONDecodeError, TypeError, ValueError):
+        return True
+
+    if not isinstance(payload, dict):
+        return True
+
+    if "response" not in payload:
+        return False
+
+    response = payload.get("response")
+
+    if response is None:
+        return False
+
+    if isinstance(response, str):
+        normalized = response.strip().upper()
+        if normalized in {"", "NA", "N/A", "NULL", "NONE"}:
+            return False
+
+    return True
+
+
 def fetch_mysql_batch(last_mysql_id: int, batch_size: int) -> List[Dict[str, Any]]:
     query = f"""
         SELECT id, inf_id, summary
@@ -128,14 +156,18 @@ def fetch_mysql_batch(last_mysql_id: int, batch_size: int) -> List[Dict[str, Any
         ORDER BY id ASC
         LIMIT %s
     """
+
     connection = connect_mysql()
+
     try:
         with connection.cursor() as cursor:
             cursor.execute(query, (last_mysql_id, batch_size))
             rows = cursor.fetchall() or []
     finally:
         connection.close()
+
     result = []
+
     for row in rows:
         result.append(
             {
@@ -144,23 +176,36 @@ def fetch_mysql_batch(last_mysql_id: int, batch_size: int) -> List[Dict[str, Any
                 "summary": normalize_summary(row.get("summary")),
             }
         )
+
     return result
 
 
 def fetch_existing_inf_ids(collection: Any, inf_ids: List[int]) -> set:
     if not inf_ids:
         return set()
+
     query = {
         "inf_id": {"$in": inf_ids},
         "stats.embedding_model": GEMINI_EMBEDDING_MODEL,
         f"embedding.{EMBED_DIM - 1}": {"$exists": True},
         f"embedding.{EMBED_DIM}": {"$exists": False},
     }
-    return {int(doc["inf_id"]) for doc in collection.find(query, {"_id": 0, "inf_id": 1})}
+
+    return {
+        int(doc["inf_id"])
+        for doc in collection.find(
+            query,
+            {
+                "_id": 0,
+                "inf_id": 1,
+            },
+        )
+    }
 
 
 def is_retryable_error(message: str) -> bool:
     lowered = message.lower()
+
     keys = [
         "resource_exhausted",
         "429",
@@ -175,6 +220,7 @@ def is_retryable_error(message: str) -> bool:
         "503",
         "500",
     ]
+
     return any(key in lowered for key in keys)
 
 
@@ -185,35 +231,48 @@ def sleep_with_backoff(attempt: int) -> None:
 def track_embedding_usage(response: Any, text: str) -> None:
     usage = getattr(response, "usage_metadata", None)
     tokens = 0
+
     if usage is not None:
         tokens = int(
             getattr(usage, "prompt_token_count", 0)
             or getattr(usage, "total_token_count", 0)
             or 0
         )
+
     if tokens <= 0:
         tokens = max(1, len(text) // 3)
+
     with _usage_lock:
         _usage["embedding_input_tokens"] += tokens
 
 
 def get_usage_snapshot() -> Dict[str, int]:
     with _usage_lock:
-        return {"embedding_input_tokens": int(_usage["embedding_input_tokens"])}
+        return {
+            "embedding_input_tokens": int(
+                _usage["embedding_input_tokens"]
+            )
+        }
 
 
 def restore_usage(values: Dict[str, Any]) -> None:
     with _usage_lock:
-        _usage["embedding_input_tokens"] = int(values.get("embedding_input_tokens", 0) or 0)
+        _usage["embedding_input_tokens"] = int(
+            values.get("embedding_input_tokens", 0) or 0
+        )
 
 
 def get_cost_summary() -> Dict[str, Any]:
     usage = get_usage_snapshot()
     tokens = usage["embedding_input_tokens"]
+
     return {
         "embedding_model": GEMINI_EMBEDDING_MODEL,
         "embedding_input_tokens": tokens,
-        "embedding_cost_usd": round(tokens / 1_000_000 * EMBEDDING_INPUT_PRICE, 6),
+        "embedding_cost_usd": round(
+            tokens / 1_000_000 * EMBEDDING_INPUT_PRICE,
+            6,
+        ),
     }
 
 
@@ -222,6 +281,7 @@ def embed_text(client: genai.Client, text: str) -> List[float]:
         try:
             if REQUEST_DELAY_SECONDS > 0:
                 time.sleep(REQUEST_DELAY_SECONDS)
+
             response = client.models.embed_content(
                 model=GEMINI_EMBEDDING_MODEL,
                 contents=[text],
@@ -230,26 +290,41 @@ def embed_text(client: genai.Client, text: str) -> List[float]:
                     output_dimensionality=EMBED_DIM,
                 ),
             )
+
             embeddings = getattr(response, "embeddings", None)
+
             if not embeddings or not isinstance(embeddings, list):
                 raise RuntimeError("No embeddings returned")
+
             values = getattr(embeddings[0], "values", None)
+
             if not values or not isinstance(values, list):
                 raise RuntimeError("Missing embedding values")
+
             vector = [float(value) for value in values]
+
             if len(vector) != EMBED_DIM:
-                raise RuntimeError(f"Unexpected embedding dimension: {len(vector)}")
+                raise RuntimeError(
+                    f"Unexpected embedding dimension: {len(vector)}"
+                )
+
             track_embedding_usage(response, text)
+
             return vector
+
         except Exception as error:
             message = str(error)
+
             if attempt < MAX_RETRIES - 1 and is_retryable_error(message):
                 sleep_with_backoff(attempt)
                 continue
+
             if attempt < MAX_RETRIES - 1:
                 sleep_with_backoff(attempt)
                 continue
+
             raise RuntimeError(message) from error
+
     raise RuntimeError("Embedding failed")
 
 
@@ -260,12 +335,19 @@ def process_embedding_batch(
 ) -> Tuple[List[Tuple[int, Dict[str, Any]]], List[int]]:
     documents: List[Tuple[int, Dict[str, Any]]] = []
     failed_mysql_ids: List[int] = []
+
     total = len(rows)
     completed = 0
     start = time.time()
 
-    def process_one(row: Dict[str, Any]) -> Tuple[int, Dict[str, Any]]:
-        vector = embed_text(client, row["summary"])
+    def process_one(
+        row: Dict[str, Any],
+    ) -> Tuple[int, Dict[str, Any]]:
+        vector = embed_text(
+            client,
+            row["summary"],
+        )
+
         document = {
             "inf_id": row["inf_id"],
             "embedding": vector,
@@ -274,32 +356,59 @@ def process_embedding_batch(
                 "embedding_model": GEMINI_EMBEDDING_MODEL,
             },
         }
+
         return row["id"], document
 
-    with ThreadPoolExecutor(max_workers=max(1, workers)) as executor:
-        future_map = {executor.submit(process_one, row): row for row in rows}
+    with ThreadPoolExecutor(
+        max_workers=max(1, workers)
+    ) as executor:
+        future_map = {
+            executor.submit(process_one, row): row
+            for row in rows
+        }
+
         for future in as_completed(future_map):
             row = future_map[future]
             completed += 1
+
             try:
-                documents.append(future.result())
+                documents.append(
+                    future.result()
+                )
+
             except Exception as error:
-                failed_mysql_ids.append(row["id"])
-                print(f"[embed-error] mysql_id={row['id']} inf_id={row['inf_id']} {str(error)[:300]}")
+                failed_mysql_ids.append(
+                    row["id"]
+                )
+
+                print(
+                    f"[embed-error] mysql_id={row['id']} "
+                    f"inf_id={row['inf_id']} "
+                    f"{str(error)[:300]}"
+                )
+
             if completed % 10 == 0 or completed == total:
                 elapsed = time.time() - start
                 rate = completed / elapsed if elapsed > 0 else 0.0
                 remaining = total - completed
                 eta = remaining / rate if rate > 0 else 0.0
                 cost = get_cost_summary()
+
                 print(
-                    f"[embed] {completed}/{total} | {rate:.2f}/s | ETA {eta:.0f}s | "
-                    f"errors={len(failed_mysql_ids)} | tokens={cost['embedding_input_tokens']} | "
+                    f"[embed] {completed}/{total} | "
+                    f"{rate:.2f}/s | "
+                    f"ETA {eta:.0f}s | "
+                    f"errors={len(failed_mysql_ids)} | "
+                    f"tokens={cost['embedding_input_tokens']} | "
                     f"cost=${cost['embedding_cost_usd']:.6f}"
                 )
 
-    documents.sort(key=lambda item: item[0])
+    documents.sort(
+        key=lambda item: item[0]
+    )
+
     failed_mysql_ids.sort()
+
     return documents, failed_mysql_ids
 
 
@@ -309,33 +418,67 @@ def write_mongodb_documents(
 ) -> List[int]:
     if not documents:
         return []
+
     operations = [
-        ReplaceOne({"inf_id": document["inf_id"]}, document, upsert=True)
+        ReplaceOne(
+            {
+                "inf_id": document["inf_id"]
+            },
+            document,
+            upsert=True,
+        )
         for _, document in documents
     ]
+
     try:
-        result = collection.bulk_write(operations, ordered=True)
+        result = collection.bulk_write(
+            operations,
+            ordered=True,
+        )
+
         print(
-            f"[mongodb] matched={result.matched_count} modified={result.modified_count} "
+            f"[mongodb] matched={result.matched_count} "
+            f"modified={result.modified_count} "
             f"upserted={result.upserted_count}"
         )
+
         return []
+
     except Exception as error:
-        print(f"[mongodb] bulk write failed, retrying individually: {str(error)[:300]}")
+        print(
+            f"[mongodb] bulk write failed, retrying individually: "
+            f"{str(error)[:300]}"
+        )
+
         failed_mysql_ids = []
+
         for mysql_id, document in documents:
             try:
-                collection.replace_one({"inf_id": document["inf_id"]}, document, upsert=True)
+                collection.replace_one(
+                    {
+                        "inf_id": document["inf_id"]
+                    },
+                    document,
+                    upsert=True,
+                )
+
             except Exception as single_error:
-                failed_mysql_ids.append(mysql_id)
+                failed_mysql_ids.append(
+                    mysql_id
+                )
+
                 print(
-                    f"[mongodb-error] mysql_id={mysql_id} inf_id={document['inf_id']} "
+                    f"[mongodb-error] mysql_id={mysql_id} "
+                    f"inf_id={document['inf_id']} "
                     f"{str(single_error)[:300]}"
                 )
+
         return failed_mysql_ids
 
 
-def new_checkpoint(limit: int) -> Dict[str, Any]:
+def new_checkpoint(
+    limit: int,
+) -> Dict[str, Any]:
     return {
         "checkpoint_version": 1,
         "mysql_database": MYSQL_DATABASE,
@@ -348,26 +491,52 @@ def new_checkpoint(limit: int) -> Dict[str, Any]:
         "total_completed": 0,
         "total_embedded": 0,
         "total_skipped_empty": 0,
+        "total_skipped_invalid_response": 0,
         "total_skipped_existing": 0,
         "total_errors": 0,
         "batch_number": 0,
         "processing_time_seconds": 0.0,
         "usage": get_usage_snapshot(),
         "cost": get_cost_summary(),
-        "updated_at": datetime.now(timezone.utc).isoformat(),
+        "updated_at": datetime.now(
+            timezone.utc
+        ).isoformat(),
     }
 
 
-def load_checkpoint(limit: int, reset: bool) -> Dict[str, Any]:
-    if reset and os.path.exists(CHECKPOINT_FILE):
-        os.remove(CHECKPOINT_FILE)
-    if not os.path.exists(CHECKPOINT_FILE):
-        return new_checkpoint(limit)
+def load_checkpoint(
+    limit: int,
+    reset: bool,
+) -> Dict[str, Any]:
+    if reset and os.path.exists(
+        CHECKPOINT_FILE
+    ):
+        os.remove(
+            CHECKPOINT_FILE
+        )
+
+    if not os.path.exists(
+        CHECKPOINT_FILE
+    ):
+        return new_checkpoint(
+            limit
+        )
+
     try:
-        with open(CHECKPOINT_FILE, "r", encoding="utf-8") as file:
-            state = json.load(file)
+        with open(
+            CHECKPOINT_FILE,
+            "r",
+            encoding="utf-8",
+        ) as file:
+            state = json.load(
+                file
+            )
+
     except Exception:
-        return new_checkpoint(limit)
+        return new_checkpoint(
+            limit
+        )
+
     expected = {
         "mysql_database": MYSQL_DATABASE,
         "mysql_table": MYSQL_TABLE,
@@ -375,101 +544,308 @@ def load_checkpoint(limit: int, reset: bool) -> Dict[str, Any]:
         "mongo_collection": MONGO_COLLECTION,
         "processing_version": PROCESSING_VERSION,
     }
+
     for key, value in expected.items():
         if state.get(key) != value:
-            return new_checkpoint(limit)
-    state["requested_limit"] = int(limit)
+            return new_checkpoint(
+                limit
+            )
+
+    state["requested_limit"] = int(
+        limit
+    )
+
     return state
 
 
-def save_checkpoint(state: Dict[str, Any]) -> None:
+def save_checkpoint(
+    state: Dict[str, Any],
+) -> None:
     state["usage"] = get_usage_snapshot()
     state["cost"] = get_cost_summary()
-    state["updated_at"] = datetime.now(timezone.utc).isoformat()
-    directory = os.path.dirname(CHECKPOINT_FILE)
+    state["updated_at"] = datetime.now(
+        timezone.utc
+    ).isoformat()
+
+    directory = os.path.dirname(
+        CHECKPOINT_FILE
+    )
+
     if directory:
-        os.makedirs(directory, exist_ok=True)
+        os.makedirs(
+            directory,
+            exist_ok=True,
+        )
+
     temp_file = CHECKPOINT_FILE + ".tmp"
-    with open(temp_file, "w", encoding="utf-8") as file:
-        json.dump(state, file, ensure_ascii=False, indent=2)
-    os.replace(temp_file, CHECKPOINT_FILE)
+
+    with open(
+        temp_file,
+        "w",
+        encoding="utf-8",
+    ) as file:
+        json.dump(
+            state,
+            file,
+            ensure_ascii=False,
+            indent=2,
+        )
+
+    os.replace(
+        temp_file,
+        CHECKPOINT_FILE,
+    )
 
 
 def process() -> None:
     args = parse_arguments()
+
     validate_config()
 
-    limit = max(0, int(args.limit))
-    batch_size = max(1, int(args.batch_size))
-    workers = max(1, int(args.workers))
+    limit = max(
+        0,
+        int(args.limit),
+    )
 
-    checkpoint = load_checkpoint(limit, args.reset_checkpoint)
-    restore_usage(checkpoint.get("usage", {}))
+    batch_size = max(
+        1,
+        int(args.batch_size),
+    )
 
-    gemini_client = genai.Client(api_key=GEMINI_API_KEY)
+    workers = max(
+        1,
+        int(args.workers),
+    )
+
+    checkpoint = load_checkpoint(
+        limit,
+        args.reset_checkpoint,
+    )
+
+    restore_usage(
+        checkpoint.get(
+            "usage",
+            {},
+        )
+    )
+
+    gemini_client = genai.Client(
+        api_key=GEMINI_API_KEY
+    )
+
     mongo_client, mongo_collection = connect_mongodb()
 
-    total_completed = int(checkpoint.get("total_completed", 0) or 0)
-    total_embedded = int(checkpoint.get("total_embedded", 0) or 0)
-    total_skipped_empty = int(checkpoint.get("total_skipped_empty", 0) or 0)
-    total_skipped_existing = int(checkpoint.get("total_skipped_existing", 0) or 0)
-    total_errors = int(checkpoint.get("total_errors", 0) or 0)
-    last_mysql_id = int(checkpoint.get("last_mysql_id", 0) or 0)
-    batch_number = int(checkpoint.get("batch_number", 0) or 0)
-    previous_elapsed = float(checkpoint.get("processing_time_seconds", 0.0) or 0.0)
+    total_completed = int(
+        checkpoint.get(
+            "total_completed",
+            0,
+        )
+        or 0
+    )
+
+    total_embedded = int(
+        checkpoint.get(
+            "total_embedded",
+            0,
+        )
+        or 0
+    )
+
+    total_skipped_empty = int(
+        checkpoint.get(
+            "total_skipped_empty",
+            0,
+        )
+        or 0
+    )
+
+    total_skipped_invalid_response = int(
+        checkpoint.get(
+            "total_skipped_invalid_response",
+            0,
+        )
+        or 0
+    )
+
+    total_skipped_existing = int(
+        checkpoint.get(
+            "total_skipped_existing",
+            0,
+        )
+        or 0
+    )
+
+    total_errors = int(
+        checkpoint.get(
+            "total_errors",
+            0,
+        )
+        or 0
+    )
+
+    last_mysql_id = int(
+        checkpoint.get(
+            "last_mysql_id",
+            0,
+        )
+        or 0
+    )
+
+    batch_number = int(
+        checkpoint.get(
+            "batch_number",
+            0,
+        )
+        or 0
+    )
+
+    previous_elapsed = float(
+        checkpoint.get(
+            "processing_time_seconds",
+            0.0,
+        )
+        or 0.0
+    )
+
     started_at = time.time()
 
     print("=" * 72)
     print("Profile Summary Embeddings")
-    print(f"MySQL:     {MYSQL_DATABASE}.{MYSQL_TABLE}")
-    print(f"MongoDB:   {MONGO_DATABASE}.{MONGO_COLLECTION}")
-    print(f"Model:     {GEMINI_EMBEDDING_MODEL}")
-    print(f"Task type: {GEMINI_EMBEDDING_TASK_TYPE}")
-    print(f"Dimension: {EMBED_DIM}")
-    print(f"Workers:   {workers}")
-    print(f"Batch:     {batch_size}")
-    print(f"Limit:     {'all' if limit == 0 else limit}")
-    print(f"Checkpoint:{CHECKPOINT_FILE}")
-    print(f"Resume ID: {last_mysql_id}")
+    print(
+        f"MySQL:     "
+        f"{MYSQL_DATABASE}.{MYSQL_TABLE}"
+    )
+    print(
+        f"MongoDB:   "
+        f"{MONGO_DATABASE}.{MONGO_COLLECTION}"
+    )
+    print(
+        f"Model:     "
+        f"{GEMINI_EMBEDDING_MODEL}"
+    )
+    print(
+        f"Task type: "
+        f"{GEMINI_EMBEDDING_TASK_TYPE}"
+    )
+    print(
+        f"Dimension: "
+        f"{EMBED_DIM}"
+    )
+    print(
+        f"Workers:   "
+        f"{workers}"
+    )
+    print(
+        f"Batch:     "
+        f"{batch_size}"
+    )
+    print(
+        f"Limit:     "
+        f"{'all' if limit == 0 else limit}"
+    )
+    print(
+        f"Checkpoint:"
+        f"{CHECKPOINT_FILE}"
+    )
+    print(
+        f"Resume ID: "
+        f"{last_mysql_id}"
+    )
     print("=" * 72)
 
     try:
         while limit == 0 or total_completed < limit:
-            remaining = batch_size if limit == 0 else min(batch_size, limit - total_completed)
+            remaining = (
+                batch_size
+                if limit == 0
+                else min(
+                    batch_size,
+                    limit - total_completed,
+                )
+            )
+
             if remaining <= 0:
                 break
 
-            rows = fetch_mysql_batch(last_mysql_id, remaining)
+            rows = fetch_mysql_batch(
+                last_mysql_id,
+                remaining,
+            )
+
             if not rows:
-                print("[mysql] No more rows to process")
+                print(
+                    "[mysql] No more rows to process"
+                )
                 break
 
             batch_number += 1
+
             print(
-                f"[batch {batch_number}] mysql_id={rows[0]['id']}..{rows[-1]['id']} "
+                f"[batch {batch_number}] "
+                f"mysql_id={rows[0]['id']}..{rows[-1]['id']} "
                 f"rows={len(rows)}"
             )
 
-            empty_ids = {row["id"] for row in rows if not row["summary"]}
-            nonempty_rows = [row for row in rows if row["id"] not in empty_ids]
+            empty_ids = {
+                row["id"]
+                for row in rows
+                if not row["summary"]
+            }
+
+            nonempty_rows = [
+                row
+                for row in rows
+                if row["id"] not in empty_ids
+            ]
+
+            invalid_response_ids = {
+                row["id"]
+                for row in nonempty_rows
+                if not has_embeddable_response(
+                    row["summary"]
+                )
+            }
+
+            valid_response_rows = [
+                row
+                for row in nonempty_rows
+                if row["id"] not in invalid_response_ids
+            ]
 
             existing_ids = set()
-            if nonempty_rows and not args.reembed_existing:
+
+            if (
+                valid_response_rows
+                and not args.reembed_existing
+            ):
                 existing_inf_ids = fetch_existing_inf_ids(
                     mongo_collection,
-                    list({row["inf_id"] for row in nonempty_rows}),
+                    list(
+                        {
+                            row["inf_id"]
+                            for row in valid_response_rows
+                        }
+                    ),
                 )
-                existing_ids = {row["id"] for row in nonempty_rows if row["inf_id"] in existing_inf_ids}
+
+                existing_ids = {
+                    row["id"]
+                    for row in valid_response_rows
+                    if row["inf_id"] in existing_inf_ids
+                }
 
             rows_to_embed = [
                 row
-                for row in nonempty_rows
+                for row in valid_response_rows
                 if row["id"] not in existing_ids
             ]
 
             print(
-                f"[batch {batch_number}] embed={len(rows_to_embed)} "
-                f"empty={len(empty_ids)} existing={len(existing_ids)}"
+                f"[batch {batch_number}] "
+                f"embed={len(rows_to_embed)} "
+                f"empty={len(empty_ids)} "
+                f"invalid_response={len(invalid_response_ids)} "
+                f"existing={len(existing_ids)}"
             )
 
             documents, embedding_failed_ids = process_embedding_batch(
@@ -478,78 +854,191 @@ def process() -> None:
                 workers,
             )
 
-            mongo_failed_ids = write_mongodb_documents(mongo_collection, documents)
-            failed_ids = sorted(set(embedding_failed_ids) | set(mongo_failed_ids))
+            mongo_failed_ids = write_mongodb_documents(
+                mongo_collection,
+                documents,
+            )
 
-            total_embedded += len(documents) - len(mongo_failed_ids)
-            total_skipped_empty += len(empty_ids)
-            total_skipped_existing += len(existing_ids)
-            total_errors += len(failed_ids)
+            failed_ids = sorted(
+                set(
+                    embedding_failed_ids
+                )
+                | set(
+                    mongo_failed_ids
+                )
+            )
+
+            total_embedded += (
+                len(documents)
+                - len(mongo_failed_ids)
+            )
+
+            total_skipped_empty += len(
+                empty_ids
+            )
+
+            total_skipped_invalid_response += len(
+                invalid_response_ids
+            )
+
+            total_skipped_existing += len(
+                existing_ids
+            )
+
+            total_errors += len(
+                failed_ids
+            )
 
             if failed_ids:
                 earliest_failed_id = failed_ids[0]
-                advanced_rows = [row for row in rows if row["id"] < earliest_failed_id]
+
+                advanced_rows = [
+                    row
+                    for row in rows
+                    if row["id"] < earliest_failed_id
+                ]
+
                 if advanced_rows:
                     last_mysql_id = advanced_rows[-1]["id"]
-                    total_completed += len(advanced_rows)
+                    total_completed += len(
+                        advanced_rows
+                    )
+
                 checkpoint["last_mysql_id"] = last_mysql_id
                 checkpoint["total_completed"] = total_completed
                 checkpoint["total_embedded"] = total_embedded
                 checkpoint["total_skipped_empty"] = total_skipped_empty
+                checkpoint["total_skipped_invalid_response"] = total_skipped_invalid_response
                 checkpoint["total_skipped_existing"] = total_skipped_existing
                 checkpoint["total_errors"] = total_errors
                 checkpoint["batch_number"] = batch_number
-                checkpoint["processing_time_seconds"] = previous_elapsed + (time.time() - started_at)
-                save_checkpoint(checkpoint)
+                checkpoint["processing_time_seconds"] = (
+                    previous_elapsed
+                    + (
+                        time.time()
+                        - started_at
+                    )
+                )
+
+                save_checkpoint(
+                    checkpoint
+                )
+
                 print(
-                    f"[stop] Batch has failures. Checkpoint saved before mysql_id={earliest_failed_id}. "
+                    f"[stop] Batch has failures. "
+                    f"Checkpoint saved before mysql_id={earliest_failed_id}. "
                     f"Restart the script to retry from that point."
                 )
+
                 break
 
             last_mysql_id = rows[-1]["id"]
-            total_completed += len(rows)
+
+            total_completed += len(
+                rows
+            )
 
             checkpoint["last_mysql_id"] = last_mysql_id
             checkpoint["total_completed"] = total_completed
             checkpoint["total_embedded"] = total_embedded
             checkpoint["total_skipped_empty"] = total_skipped_empty
+            checkpoint["total_skipped_invalid_response"] = total_skipped_invalid_response
             checkpoint["total_skipped_existing"] = total_skipped_existing
             checkpoint["total_errors"] = total_errors
             checkpoint["batch_number"] = batch_number
-            checkpoint["processing_time_seconds"] = previous_elapsed + (time.time() - started_at)
-            save_checkpoint(checkpoint)
+            checkpoint["processing_time_seconds"] = (
+                previous_elapsed
+                + (
+                    time.time()
+                    - started_at
+                )
+            )
+
+            save_checkpoint(
+                checkpoint
+            )
 
             cost = get_cost_summary()
+
             print(
-                f"[checkpoint] completed={total_completed} embedded={total_embedded} "
-                f"empty={total_skipped_empty} existing={total_skipped_existing} errors={total_errors} "
-                f"last_mysql_id={last_mysql_id} cost=${cost['embedding_cost_usd']:.6f}"
+                f"[checkpoint] "
+                f"completed={total_completed} "
+                f"embedded={total_embedded} "
+                f"empty={total_skipped_empty} "
+                f"invalid_response={total_skipped_invalid_response} "
+                f"existing={total_skipped_existing} "
+                f"errors={total_errors} "
+                f"last_mysql_id={last_mysql_id} "
+                f"cost=${cost['embedding_cost_usd']:.6f}"
             )
+
     finally:
         checkpoint["last_mysql_id"] = last_mysql_id
         checkpoint["total_completed"] = total_completed
         checkpoint["total_embedded"] = total_embedded
         checkpoint["total_skipped_empty"] = total_skipped_empty
+        checkpoint["total_skipped_invalid_response"] = total_skipped_invalid_response
         checkpoint["total_skipped_existing"] = total_skipped_existing
         checkpoint["total_errors"] = total_errors
         checkpoint["batch_number"] = batch_number
-        checkpoint["processing_time_seconds"] = previous_elapsed + (time.time() - started_at)
-        save_checkpoint(checkpoint)
+        checkpoint["processing_time_seconds"] = (
+            previous_elapsed
+            + (
+                time.time()
+                - started_at
+            )
+        )
+
+        save_checkpoint(
+            checkpoint
+        )
+
         mongo_client.close()
 
     cost = get_cost_summary()
+
     print("=" * 72)
     print("Done")
-    print(f"Completed source rows: {total_completed}")
-    print(f"Embedded:             {total_embedded}")
-    print(f"Skipped empty:         {total_skipped_empty}")
-    print(f"Skipped existing:      {total_skipped_existing}")
-    print(f"Errors:                {total_errors}")
-    print(f"Last MySQL id:         {last_mysql_id}")
-    print(f"Embedding tokens:      {cost['embedding_input_tokens']}")
-    print(f"Estimated cost:        ${cost['embedding_cost_usd']:.6f}")
-    print(f"Checkpoint:            {CHECKPOINT_FILE}")
+    print(
+        f"Completed source rows:   "
+        f"{total_completed}"
+    )
+    print(
+        f"Embedded:                "
+        f"{total_embedded}"
+    )
+    print(
+        f"Skipped empty:           "
+        f"{total_skipped_empty}"
+    )
+    print(
+        f"Skipped invalid response:"
+        f"{total_skipped_invalid_response}"
+    )
+    print(
+        f"Skipped existing:        "
+        f"{total_skipped_existing}"
+    )
+    print(
+        f"Errors:                  "
+        f"{total_errors}"
+    )
+    print(
+        f"Last MySQL id:           "
+        f"{last_mysql_id}"
+    )
+    print(
+        f"Embedding tokens:        "
+        f"{cost['embedding_input_tokens']}"
+    )
+    print(
+        f"Estimated cost:          "
+        f"${cost['embedding_cost_usd']:.6f}"
+    )
+    print(
+        f"Checkpoint:              "
+        f"{CHECKPOINT_FILE}"
+    )
     print("=" * 72)
 
 
@@ -560,5 +1049,7 @@ if __name__ == "__main__":
         print("Interrupted")
         sys.exit(130)
     except Exception as error:
-        print(f"Fatal: {error}")
+        print(
+            f"Fatal: {error}"
+        )
         sys.exit(1)
