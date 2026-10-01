@@ -43,26 +43,10 @@ def _get_float(name: str, raw_value: str, minimum: float | None = None) -> float
 
 
 # mongodb settings
-MONGO_URI = (
-    os.getenv("MONGO_URI_ATLAS_SG")
-    or os.getenv("MONGO_URI_ATLAS")
-    or ""
-).strip()
-MONGO_DATABASE = (
-    os.getenv("MONGO_DB_ATLAS_SG")
-    or os.getenv("MONGO_DB_ATLAS")
-    or "ai-vector-search-transit"
-).strip()
-MONGO_SOURCE_COLLECTION = (
-    os.getenv("MONGO_COLL_ATLAS_SG")
-    or os.getenv("MONGO_COLL_ATLAS")
-    or "ig-post-sg"
-).strip()
-MONGO_TEMP_COLLECTION = (
-    os.getenv("MONGO_TEMP_COLL_ATLAS_SG")
-    or os.getenv("MONGO_TEMP_COLLECTION")
-    or MONGO_SOURCE_COLLECTION
-).strip()
+MONGO_URI = (os.getenv("MONGO_URI_ATLAS_MYHKSG") or "").strip()
+MONGO_DATABASE = (os.getenv("MONGO_DB_ATLAS_MYHKSG") or "").strip()
+MONGO_SOURCE_COLLECTION = (os.getenv("MONGO_COLL_ATLAS_MY") or "").strip()
+MONGO_TEMP_COLLECTION = MONGO_SOURCE_COLLECTION
 
 # mysql settings
 MYSQL_HOST = (
@@ -120,7 +104,7 @@ EMBEDDING_INPUT_PRICE_RAW = (
 # processing settings
 DEFAULT_LIMIT_RAW = (os.getenv("DEFAULT_LIMIT") or "500000").strip()
 DEFAULT_BATCH_SIZE_RAW = (os.getenv("DEFAULT_BATCH_SIZE") or "1000").strip()
-DEFAULT_LOCATION_ID_RAW = (os.getenv("DEFAULT_LOCATION_ID") or "4").strip()
+DEFAULT_LOCATION_ID_RAW = (os.getenv("DEFAULT_LOCATION_ID") or "3").strip()
 MAX_WORKERS_RAW = (os.getenv("MAX_WORKERS") or "8").strip()
 REQUEST_DELAY_SECONDS_RAW = (
     os.getenv("REQUEST_DELAY_SECONDS") or "0.25"
@@ -186,7 +170,7 @@ POSTS_BACKUP_FILE = OUTPUT_DIR / "posts.json"
 SUMMARY_OUTPUT_FILE = OUTPUT_DIR / "processing_summary.json"
 CHECKPOINT_FILE = Path(
     os.getenv("GEMINI_CHECKPOINT_FILE")
-    or BASE_DIR / "ig_post_sg_gemini_checkpoint.json"
+    or BASE_DIR / "ig_post_my_aug_sept_gemini_checkpoint.json"
 ).resolve()
 PROCESSING_VERSION = (
     f"{GEMINI_EXTRACTION_MODEL}|{GEMINI_EMBEDDING_MODEL}|{EMBED_DIM}"

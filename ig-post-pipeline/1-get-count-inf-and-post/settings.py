@@ -5,8 +5,8 @@ from dotenv import load_dotenv # type: ignore
 load_dotenv()
 
 # post settings
-LOCATION_ID = 4
-POST_DATE_FROM = "2025-01-01"
+LOCATION_ID = 3
+POST_DATE_FROM = "2026-01-01"
 POST_DATE_UNTIL = "2026-07-31"
 LIMIT_PER_INFLUENCER = 10000
 

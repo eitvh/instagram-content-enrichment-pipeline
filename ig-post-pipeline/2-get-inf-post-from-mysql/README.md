@@ -166,10 +166,10 @@ CRAWL_DB_PASSWORD=my_mysql_password
 CRAWL_DB_DATABASE=my_mysql_database
 
 # MongoDB
-MONGO_URI_ATLAS_SG=mongodb+srv://username:password@cluster.example.mongodb.net/
-MONGO_DB_ATLAS_SG=my_mongo_database
-MONGO_COLL_ATLAS_SG=instagram_posts
-MONGO_CHECKPOINT_COLL=ig-post-sg-checkpoint
+MONGO_URI_ATLAS_MYHKSG=mongodb+srv://username:password@cluster.example.mongodb.net/
+MONGO_DB_ATLAS_MYHKSG=my_mongo_database
+MONGO_COLL_ATLAS_MY=instagram_posts
+MONGO_CHECKPOINT_COLL_MY=ig-post-my-checkpoint
 ```
 
 Do not surround values with quotes unless those quotes are part of the actual value.
@@ -204,24 +204,24 @@ ValueError: Invalid database port value 'invalid'. Use an integer like '3306'.
 
 | Variable                | Description                                          | Required |
 | ----------------------- | ---------------------------------------------------- | -------- |
-| `MONGO_URI_ATLAS_SG`    | MongoDB or MongoDB Atlas connection string.          | Yes      |
-| `MONGO_DB_ATLAS_SG`     | Target MongoDB database.                             | Yes      |
-| `MONGO_COLL_ATLAS_SG`   | Collection receiving Instagram post documents.       | Yes      |
-| `MONGO_CHECKPOINT_COLL` | Collection storing completed-influencer checkpoints. | No       |
+| `MONGO_URI_ATLAS_MYHKSG`    | MongoDB or MongoDB Atlas connection string.          | Yes      |
+| `MONGO_DB_ATLAS_MYHKSG`     | Target MongoDB database.                             | Yes      |
+| `MONGO_COLL_ATLAS_MY`   | Collection receiving Instagram post documents.       | Yes      |
+| `MONGO_CHECKPOINT_COLL_MY` | Collection storing completed-influencer checkpoints. | No       |
 
-When `MONGO_CHECKPOINT_COLL` is not set, the default collection name is:
+When `MONGO_CHECKPOINT_COLL_MY` is not set, the default collection name is:
 
 ```text
-ig-post-sg-checkpoint
+ig-post-my-checkpoint
 ```
 
 The script validates these required settings before connecting:
 
 * `CRAWL_DB_USERNAME`
 * `CRAWL_DB_DATABASE`
-* `MONGO_URI_ATLAS_SG`
-* `MONGO_DB_ATLAS_SG`
-* `MONGO_COLL_ATLAS_SG`
+* `MONGO_URI_ATLAS_MYHKSG`
+* `MONGO_DB_ATLAS_MYHKSG`
+* `MONGO_COLL_ATLAS_MY`
 
 ## Running the Script
 
@@ -678,7 +678,7 @@ __pycache__/
 ### Missing required variables
 
 ```text
-Missing required environment variables: CRAWL_DB_USERNAME, MONGO_URI_ATLAS_SG
+Missing required environment variables: CRAWL_DB_USERNAME, MONGO_URI_ATLAS_MYHKSG
 ```
 
 Confirm that the `.env` file exists and contains the required values.
@@ -856,12 +856,12 @@ DB_DATABASE = (
 )
 
 # MongoDB settings
-MONGO_URI = (os.getenv("MONGO_URI_ATLAS_SG") or "").strip()
-MONGO_DATABASE = (os.getenv("MONGO_DB_ATLAS_SG") or "").strip()
-MONGO_COLLECTION = (os.getenv("MONGO_COLL_ATLAS_SG") or "").strip()
+MONGO_URI = (os.getenv("MONGO_URI_ATLAS_MYHKSG") or "").strip()
+MONGO_DATABASE = (os.getenv("MONGO_DB_ATLAS_MYHKSG") or "").strip()
+MONGO_COLLECTION = (os.getenv("MONGO_COLL_ATLAS_MY") or "").strip()
 
-MONGO_CHECKPOINT_COLLECTION = (
-    os.getenv("MONGO_CHECKPOINT_COLL") or "ig-post-sg-checkpoint"
+MONGO_CHECKPOINT_COLL_MYECTION = (
+    os.getenv("MONGO_CHECKPOINT_COLL_MY") or "ig-post-my-checkpoint"
 ).strip()
 
 

@@ -185,13 +185,13 @@ def validate_settings() -> None:
         missing.append("CRAWL_DB_DATABASE")
 
     if not settings.MONGO_URI:
-        missing.append("MONGO_URI_ATLAS_SG")
+        missing.append("MONGO_URI_ATLAS_MYHKSG")
 
     if not settings.MONGO_DATABASE:
-        missing.append("MONGO_DB_ATLAS_SG")
+        missing.append("MONGO_DB_ATLAS_MYHKSG")
 
     if not settings.MONGO_COLLECTION:
-        missing.append("MONGO_COLL_ATLAS_SG")
+        missing.append("MONGO_COLL_ATLAS_MY")
 
     if missing:
         raise SystemExit(

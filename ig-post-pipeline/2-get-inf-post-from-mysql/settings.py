@@ -5,11 +5,11 @@ from dotenv import load_dotenv # type: ignore
 load_dotenv()
 
 # post settings
-LOCATION_ID = 4
-POST_DATE_FROM = "2025-01-01"
-POST_DATE_UNTIL = "2026-07-31"
+LOCATION_ID = 3
+POST_DATE_FROM = "2026-08-01"
+POST_DATE_UNTIL = "2026-09-30"
 LIMIT_PER_INFLUENCER = 10000
-MAX_DOCS = 0
+MAX_DOCS = 500000   
 BATCH_SIZE = 500
 
 # database settings
@@ -37,11 +37,11 @@ DB_DATABASE = (
 )
 
 # mongo settings
-MONGO_URI = (os.getenv("MONGO_URI_ATLAS_SG") or "").strip()
-MONGO_DATABASE = (os.getenv("MONGO_DB_ATLAS_SG") or "").strip()
-MONGO_COLLECTION = (os.getenv("MONGO_COLL_ATLAS_SG") or "").strip()
+MONGO_URI = (os.getenv("MONGO_URI_ATLAS_MYHKSG") or "").strip()
+MONGO_DATABASE = (os.getenv("MONGO_DB_ATLAS_MYHKSG") or "").strip()
+MONGO_COLLECTION = (os.getenv("MONGO_COLL_ATLAS_MY") or "").strip()
 MONGO_CHECKPOINT_COLLECTION = (
-    os.getenv("MONGO_CHECKPOINT_COLL") or "ig-post-sg-checkpoint"
+    os.getenv("MONGO_CHECKPOINT_COLL_MY") or "ig-my-aug-sept-checkpoint"
 ).strip()
 
 

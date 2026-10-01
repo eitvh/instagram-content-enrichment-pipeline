@@ -122,7 +122,7 @@ def is_retryable_error(error_message: str) -> bool:
 
 def connect_mongodb() -> Tuple[MongoClient, Any, Any]:
     if not MONGO_URI:
-        raise SystemExit('FATAL: MONGO_URI_ATLAS_SG is not set in .env')
+        raise SystemExit('FATAL: MONGO_URI_ATLAS_MYHKSG is not set in .env')
     client = MongoClient(MONGO_URI)
     client.admin.command('ping')
     database = client[MONGO_DATABASE]
