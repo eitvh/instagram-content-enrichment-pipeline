@@ -1,3 +1,4 @@
+import argparse
 import sys
 import time
 from typing import Any, Dict, List, Optional, Set, Tuple
@@ -191,7 +192,10 @@ def validate_settings() -> None:
         missing.append("MONGO_DB_ATLAS_MYHKSG")
 
     if not settings.MONGO_COLLECTION:
-        missing.append("MONGO_COLL_ATLAS_HK")
+        missing.append(settings.POST_COLLECTION_ENV)
+
+    if not settings.MONGO_CHECKPOINT_COLLECTION:
+        missing.append(settings.CHECKPOINT_COLLECTION_ENV)
 
     if missing:
         raise SystemExit(
@@ -290,12 +294,14 @@ def fetch_influencers(location_id: int) -> List[Dict[str, Any]]:
             inf.locationId AS locationId,
             inf.ig_user_id AS ig_user_id,
             inf.identityId AS identityId,
+            inf.sourceFrom AS sourceFrom,
             iu.followerCount AS followerCount
         FROM influencer AS inf
         INNER JOIN ig_user AS iu
             ON iu.id = inf.ig_user_id
         WHERE inf.deleted_at IS NULL
           AND inf.locationId = %s
+          AND inf.sourceFrom = %s
           AND inf.ig_user_id IS NOT NULL
     """
 
@@ -303,7 +309,7 @@ def fetch_influencers(location_id: int) -> List[Dict[str, Any]]:
 
     try:
         with connection.cursor() as cursor:
-            cursor.execute(sql, (location_id,))
+            cursor.execute(sql, (location_id, settings.INFLUENCER_SOURCE))
             return cursor.fetchall() or []
     finally:
         connection.close()
@@ -316,8 +322,8 @@ def fetch_posts_for_influencer(
     date_until: Optional[str],
     limit_n: int,
 ) -> List[Dict[str, Any]]:
-    where_parts = ["inf.id = %s"]
-    params: List[Any] = [influencer_id]
+    where_parts = ["inf.id = %s", "inf.sourceFrom = %s", "inf.deleted_at IS NULL"]
+    params: List[Any] = [influencer_id, settings.INFLUENCER_SOURCE]
 
     if date_from:
         where_parts.append("ig_post.postDate >= UNIX_TIMESTAMP(%s)")
@@ -510,6 +516,9 @@ def main() -> int:
 
         print(
             f"[info] locationId={location_id} "
+            f"sourceFrom={settings.INFLUENCER_SOURCE} "
+            f"posts_collection={settings.MONGO_COLLECTION} "
+            f"checkpoint_collection={settings.MONGO_CHECKPOINT_COLLECTION} "
             f"influencers={total_influencers} "
             f"completed={len(completed_ids)} "
             f"from={date_from} "
@@ -665,5 +674,28 @@ def main() -> int:
         mongo_client.close()
 
 
+def cli() -> int:
+    parser = argparse.ArgumentParser(description="Import External Helper influencer posts.")
+    parser.add_argument(
+        "--all-countries", action="store_true",
+        help="Run MY, HK, then SG, each with its own collections and post limit.",
+    )
+    args = parser.parse_args()
+    locations = [3, 1, 4] if args.all_countries else [settings.LOCATION_ID]
+
+    # Check all requested configurations before starting any database work.
+    for location_id in locations:
+        settings.configure_location(location_id)
+        validate_settings()
+
+    for location_id in locations:
+        settings.configure_location(location_id)
+        print(f"[country] Starting {settings.COUNTRY}", file=sys.stderr, flush=True)
+        result = main()
+        if result:
+            return result
+    return 0
+
+
 if __name__ == "__main__":
-    raise SystemExit(main())
+    raise SystemExit(cli())

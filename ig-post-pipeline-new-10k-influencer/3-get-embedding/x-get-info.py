@@ -3,6 +3,7 @@ import time
 import json
 import re
 import argparse
+import settings
 import threading
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from typing import List, Dict, Any, Optional, Tuple
@@ -47,11 +48,18 @@ def parse_arguments() -> argparse.Namespace:
     parser.add_argument('--source', choices=['mongodb'], default='mongodb', help='Data source for post IDs and captions (default: MongoDB)')
     parser.add_argument('--limit', type=int, default=DEFAULT_LIMIT, help=f'Maximum total posts to process across checkpoint resumes (default: {DEFAULT_LIMIT})')
     parser.add_argument('--batch-size', type=int, default=DEFAULT_BATCH_SIZE, help=f'Posts per batch when loading from MongoDB (default: {DEFAULT_BATCH_SIZE}). Total limit is split into batches to avoid long loading times.')
-    parser.add_argument('--location-id', type=int, default=3, help='Location ID filter when using MongoDB source; use 0 for all (default: 3)')
+    countries = parser.add_mutually_exclusive_group()
+    countries.add_argument('--location-id', type=int, choices=[1, 3, 4], default=DEFAULT_LOCATION_ID, help='Country: 1=HK, 3=MY, 4=SG; defaults to DEFAULT_LOCATION_ID')
+    countries.add_argument('--all-countries', action='store_true', help='Process MY, HK, then SG with separate collections, checkpoints, and limits')
     parser.add_argument('--workers', type=int, default=MAX_WORKERS, help=f'Number of concurrent workers (default: {MAX_WORKERS})')
     parser.add_argument('--skip-existing', action='store_true', help='Skip posts already completed for the current extraction and embedding models')
     parser.add_argument('--reset-checkpoint', action='store_true', help='Reset checkpoint counters before processing')
-    return parser.parse_args()
+    args = parser.parse_args()
+    if args.limit < 0:
+        parser.error('--limit must be >= 0 (0 processes no posts)')
+    if args.batch_size < 1 or args.workers < 1:
+        parser.error('--batch-size and --workers must be >= 1')
+    return args
 
 def is_meaningful_caption(text: Optional[str]) -> bool:
     if not text or not isinstance(text, str):
@@ -424,13 +432,12 @@ def save_checkpoint(state: Dict[str, Any]) -> None:
         json.dump(state, f, ensure_ascii=False, indent=2, default=str)
     temp_file.replace(CHECKPOINT_FILE)
 
-def process_posts() -> None:
-    args = parse_arguments()
+def process_posts(args: argparse.Namespace) -> None:
     source = args.source
     max_posts = max(0, int(args.limit))
     location_id = int(args.location_id)
     print('=' * 60)
-    print('Embedding Test Pipeline')
+    print('New External Helper Post Embedding Pipeline')
     print(f'  Source:        {source}')
     print(f'  Location ID:   {location_id}')
     print(f'  Post limit:    {max_posts}')
@@ -567,7 +574,6 @@ def process_posts() -> None:
     print(f"  Cost (est.):       ${cost['total_cost_usd']:.4f}")
     print(f"    Extraction:      {cost['extraction_input_tokens']} in / {cost['extraction_output_tokens']} out tokens (${cost['extraction_cost_usd']:.4f})")
     print(f"    Embedding:       {cost['embedding_input_tokens']} tokens (${cost['embedding_cost_usd']:.4f})")
-    print(f'  Run search:        python evaluation.py "your query"')
     print(f"{'=' * 60}")
 
 def process_post_batch(gemini_client: genai.Client, mongo_database: Any, temp_collection_name: str, posts: List[Dict[str, Any]], workers: int, checkpoint_callback: Optional[Any]=None) -> Dict[str, Any]:
@@ -662,9 +668,47 @@ def process_post_batch(gemini_client: genai.Client, mongo_database: Any, temp_co
     flush_upsert_batch()
     progress = current_progress()
     return {'records': processed_records, 'success_count': progress['success_count'], 'skip_count': progress['skip_count'], 'error_count': progress['error_count'], 'completed_count': progress['completed_count']}
+def configure_country(location_id: int) -> None:
+    # Processing functions import these values directly; refresh them together.
+    global MONGO_SOURCE_COLLECTION, MONGO_TEMP_COLLECTION, CHECKPOINT_FILE
+    global OUTPUT_DIR, POSTS_BACKUP_FILE, SUMMARY_OUTPUT_FILE
+    settings.configure_location(location_id)
+    MONGO_SOURCE_COLLECTION = settings.MONGO_SOURCE_COLLECTION
+    MONGO_TEMP_COLLECTION = settings.MONGO_TEMP_COLLECTION
+    CHECKPOINT_FILE = settings.CHECKPOINT_FILE
+    OUTPUT_DIR = settings.OUTPUT_DIR
+    POSTS_BACKUP_FILE = settings.POSTS_BACKUP_FILE
+    SUMMARY_OUTPUT_FILE = settings.SUMMARY_OUTPUT_FILE
+    restore_usage({})
+
+
+def main() -> None:
+    args = parse_arguments()
+    locations = [3, 1, 4] if args.all_countries else [args.location_id]
+    # Fail before API calls or writes if any requested country is unconfigured.
+    missing = []
+    for name, value in [('MONGO_URI_ATLAS_MYHKSG', MONGO_URI),
+                        ('MONGO_DB_ATLAS_MYHKSG', MONGO_DATABASE),
+                        ('GEMINI_API_KEY', GEMINI_API_KEY)]:
+        if not value:
+            missing.append(name)
+    for location_id in locations:
+        configure_country(location_id)
+        if not MONGO_SOURCE_COLLECTION:
+            missing.append(f'MONGO_COLL_NEW_INFLUENCER_{settings.COUNTRY_BY_LOCATION[location_id]}')
+    if missing:
+        raise SystemExit('Missing required environment variables: ' + ', '.join(missing))
+    for location_id in locations:
+        configure_country(location_id)
+        country_args = argparse.Namespace(**vars(args))
+        country_args.location_id = location_id
+        print(f'[country] Starting {settings.COUNTRY_BY_LOCATION[location_id]}')
+        process_posts(country_args)
+
+
 if __name__ == '__main__':
     try:
-        process_posts()
+        main()
     except KeyboardInterrupt:
         print('\nInterrupted.')
         sys.exit(130)

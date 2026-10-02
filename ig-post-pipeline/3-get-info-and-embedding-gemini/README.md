@@ -999,3 +999,14 @@ Also review API quota and retry settings.
 ## License
 
 Add the appropriate license for your project.
+
+## MongoDB fetch timeouts
+
+Fetching lets MongoDB choose its index. Optional root `.env` settings:
+
+```dotenv
+MONGO_QUERY_TIMEOUT_MS=120000
+MONGO_QUERY_ATTEMPTS=3
+```
+
+These defaults allow 120 seconds per query attempt and up to three attempts, with 2- and 4-second delays after timeouts. Failed cursors are closed and partial fetch results discarded before retrying. Other database errors still propagate. Exhausted retries stop the run using the existing checkpoint handling. Selection filters, processing rules, limits, and checkpoint format are unchanged. No database indexes are created by this change; query performance still depends on available indexes. An unhinted query may return eligible posts in a different order (no ordering was guaranteed before).

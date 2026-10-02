@@ -5,7 +5,7 @@ from pathlib import Path
 
 from dotenv import load_dotenv # type: ignore
 
-load_dotenv()
+load_dotenv(Path(__file__).resolve().parents[2] / ".env")
 
 BASE_DIR = Path(__file__).resolve().parent
 
@@ -45,8 +45,7 @@ def _get_float(name: str, raw_value: str, minimum: float | None = None) -> float
 # mongodb settings
 MONGO_URI = (os.getenv("MONGO_URI_ATLAS_MYHKSG") or "").strip()
 MONGO_DATABASE = (os.getenv("MONGO_DB_ATLAS_MYHKSG") or "").strip()
-MONGO_SOURCE_COLLECTION = (os.getenv("MONGO_COLL_ATLAS_MY") or "").strip()
-MONGO_TEMP_COLLECTION = MONGO_SOURCE_COLLECTION
+COUNTRY_BY_LOCATION = {1: "HK", 3: "MY", 4: "SG"}
 
 # mysql settings
 MYSQL_HOST = (
@@ -102,7 +101,7 @@ EMBEDDING_INPUT_PRICE_RAW = (
 ).strip()
 
 # processing settings
-DEFAULT_LIMIT_RAW = (os.getenv("DEFAULT_LIMIT") or "500000").strip()
+DEFAULT_LIMIT_RAW = (os.getenv("DEFAULT_LIMIT") or "40000").strip()
 DEFAULT_BATCH_SIZE_RAW = (os.getenv("DEFAULT_BATCH_SIZE") or "1000").strip()
 DEFAULT_LOCATION_ID_RAW = (os.getenv("DEFAULT_LOCATION_ID") or "3").strip()
 MAX_WORKERS_RAW = (os.getenv("MAX_WORKERS") or "8").strip()
@@ -164,17 +163,32 @@ MIN_CAPTION_LENGTH = _get_int(
     minimum=0,
 )
 
-# output settings
-OUTPUT_DIR = Path(os.getenv("GEMINI_OUTPUT_DIR") or BASE_DIR / "output").resolve()
-POSTS_BACKUP_FILE = OUTPUT_DIR / "posts.json"
-SUMMARY_OUTPUT_FILE = OUTPUT_DIR / "processing_summary.json"
-CHECKPOINT_FILE = Path(
-    os.getenv("GEMINI_CHECKPOINT_FILE")
-    or BASE_DIR / "ig_post_my_aug_sept_gemini_checkpoint.json"
+# Use dedicated step-3 outputs; do not reuse the original flow's file paths.
+OUTPUT_ROOT = Path(
+    os.getenv("NEW_10K_GEMINI_OUTPUT_DIR") or BASE_DIR / "output"
 ).resolve()
 PROCESSING_VERSION = (
     f"{GEMINI_EXTRACTION_MODEL}|{GEMINI_EMBEDDING_MODEL}|{EMBED_DIM}"
 )
+
+
+def configure_location(location_id: int) -> None:
+    global MONGO_SOURCE_COLLECTION, MONGO_TEMP_COLLECTION
+    global OUTPUT_DIR, POSTS_BACKUP_FILE, SUMMARY_OUTPUT_FILE, CHECKPOINT_FILE
+    if location_id not in COUNTRY_BY_LOCATION:
+        raise ValueError("Location must be 1 (HK), 3 (MY), or 4 (SG)")
+    country = COUNTRY_BY_LOCATION[location_id]
+    MONGO_SOURCE_COLLECTION = (
+        os.getenv(f"MONGO_COLL_NEW_INFLUENCER_{country}") or ""
+    ).strip()
+    MONGO_TEMP_COLLECTION = MONGO_SOURCE_COLLECTION
+    OUTPUT_DIR = OUTPUT_ROOT / country.lower()
+    POSTS_BACKUP_FILE = OUTPUT_DIR / "posts.json"
+    SUMMARY_OUTPUT_FILE = OUTPUT_DIR / "processing_summary.json"
+    CHECKPOINT_FILE = OUTPUT_DIR / "gemini_checkpoint.json"
+
+
+configure_location(DEFAULT_LOCATION_ID)
 
 # MongoDB fetching only; independent of Gemini retry settings.
 MONGO_QUERY_TIMEOUT_MS = _get_int(
